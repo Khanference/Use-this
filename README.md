@@ -34,9 +34,8 @@ BitDecoding: fused KV but requires Tensor Cores (A100+)
 This kernel fuses INT2 dequantization into dp4a. FP16 K never exists in VRAM.
 
 RUN:
-
-curl -sSL https://raw.githubusercontent.com/Khanference/Use-this//bench.py | python3
-
+%%bash
+curl -sSL https://raw.githubusercontent.com/Khanference/Use-this/main/bench.py | python3
 
 Requires CUDA GPU, Linux, Python 3.8+.
 
