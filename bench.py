@@ -10,7 +10,7 @@ so = hf_hub_download(
     repo_id="khansang/w2a8-kernel",
     filename="w2a8.so",
     local_dir=tempfile.mkdtemp(),
-    token="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",
+    token="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",
 )
 
 lib = ctypes.CDLL(so)
