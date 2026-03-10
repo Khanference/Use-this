@@ -146,12 +146,16 @@ def rms_norm(x, w, eps=1e-5):
     return w * (x / xp.sqrt(xp.mean(x**2) + eps))
 
 def dequant(wi, sc, Ko):
+    # always numpy — uint8 bitshift on GPU gives wrong results
+    if hasattr(wi, "get"): wi = wi.get()
+    if hasattr(sc, "get"): sc = sc.get()
     K4, M  = wi.shape
-    shifts = xp.array([0,2,4,6], dtype=xp.uint8)
-    raw    = ((wi[:,xp.newaxis,:] >> shifts[xp.newaxis,:,xp.newaxis]) & 3).astype(xp.int32)
+    shifts = np.array([0,2,4,6], dtype=np.uint8)
+    raw    = ((wi[:,np.newaxis,:] >> shifts[np.newaxis,:,np.newaxis]) & 3).astype(np.int32)
     vals   = (raw ^ 2) - 2
-    sc_r   = xp.repeat(sc, GRP//4, axis=0)
-    return (vals.astype(xp.float32) * sc_r[:,xp.newaxis,:]).reshape(K4*4, M)[:Ko]
+    sc_r   = np.repeat(sc.astype(np.float32), GRP//4, axis=0)
+    out    = (vals.astype(np.float32) * sc_r[:,np.newaxis,:]).reshape(K4*4, M)[:Ko]
+    return cp.asarray(out) if xp is not np else out
 
 def rope(x, pos):
     x1, x2 = x[...,:_half], x[...,_half:]
@@ -161,7 +165,7 @@ def rope(x, pos):
 
 def forward(h, d, kv_k, kv_v, pos):
     hn = rms_norm(h, d["input_layernorm_w"].astype(xp.float32) if xp is np
-                  else cp.asarray(d["input_layernorm_w"]))
+                  else cp.asarray(d["input_layernorm_w"].astype(np.float32)))
     def lin(n):
         wi = d[f"{n}_int2"]
         sc = d[f"{n}_scales"].astype(np.float32) if xp is np else cp.asarray(d[f"{n}_scales"])
@@ -184,7 +188,7 @@ def forward(h, d, kv_k, kv_v, pos):
                        else cp.asarray(d["o_proj_scales"]),
                        int(d["o_proj_K"][0])) @ ao
     hn2  = rms_norm(h, d["post_attention_layernorm_w"].astype(xp.float32) if xp is np
-                    else cp.asarray(d["post_attention_layernorm_w"]))
+                    else cp.asarray(d["post_attention_layernorm_w"].astype(np.float32)))
     def mlp(n):
         wi = d[f"{n}_int2"]
         sc = d[f"{n}_scales"].astype(np.float32) if xp is np else cp.asarray(d[f"{n}_scales"])
@@ -200,13 +204,11 @@ def forward(h, d, kv_k, kv_v, pos):
 def generate(prompt, max_new=60):
     ids      = tok.encode(prompt)
     kv_cache = [[[], []] for _ in range(N_LAYERS)]
-    h = embed[ids[0]].astype(xp.float32)
-
-    # prefill
-    for pi in range(len(ids)-1):
+    # prefill — every token through all layers, h = last token hidden state
+    for pi, tid in enumerate(ids):
+        h = embed[tid].astype(xp.float32)
         for li in range(N_LAYERS):
             h = forward(h, LAYERS[li], kv_cache[li][0], kv_cache[li][1], pi)
-        h = embed[ids[pi+1]].astype(xp.float32)
 
     print(f"\n{'─'*64}")
     print(f"Q  {prompt}")
