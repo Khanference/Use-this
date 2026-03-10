@@ -146,16 +146,13 @@ def rms_norm(x, w, eps=1e-5):
     return w * (x / xp.sqrt(xp.mean(x**2) + eps))
 
 def dequant(wi, sc, Ko):
-    # always numpy — uint8 bitshift on GPU gives wrong results
-    if hasattr(wi, "get"): wi = wi.get()
-    if hasattr(sc, "get"): sc = sc.get()
     K4, M  = wi.shape
-    shifts = np.array([0,2,4,6], dtype=np.uint8)
-    raw    = ((wi[:,np.newaxis,:] >> shifts[np.newaxis,:,np.newaxis]) & 3).astype(np.int32)
+    wi     = wi.astype(xp.int32)
+    shifts = xp.array([0,2,4,6], dtype=xp.int32)
+    raw    = ((wi[:,xp.newaxis,:] >> shifts[xp.newaxis,:,xp.newaxis]) & 3)
     vals   = (raw ^ 2) - 2
-    sc_r   = np.repeat(sc.astype(np.float32), GRP//4, axis=0)
-    out    = (vals.astype(np.float32) * sc_r[:,np.newaxis,:]).reshape(K4*4, M)[:Ko]
-    return cp.asarray(out) if xp is not np else out
+    sc_r   = xp.repeat(sc.astype(xp.float32), GRP//4, axis=0)
+    return (vals.astype(xp.float32) * sc_r[:,xp.newaxis,:]).reshape(K4*4, M)[:Ko]
 
 def rope(x, pos):
     x1, x2 = x[...,:_half], x[...,_half:]
