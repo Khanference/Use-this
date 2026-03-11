@@ -43,10 +43,10 @@ lib.gemv_w2a8_inference.restype  = None
 lib.gemv_w2a8_inference.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                      ctypes.c_void_p, ctypes.c_void_p,
                                      ctypes.c_int, ctypes.c_int]
-lib.kv_int2_fused_attn.restype   = None
-lib.kv_int2_fused_attn.argtypes  = [ctypes.c_void_p, ctypes.c_void_p,
-                                     ctypes.c_void_p, ctypes.c_void_p,
-                                     ctypes.c_int, ctypes.c_int, ctypes.c_int]
+lib.launch_kv_int2_fused_attn.restype   = None
+lib.launch_kv_int2_fused_attn.argtypes  = [ctypes.c_void_p, ctypes.c_void_p,
+                                            ctypes.c_void_p, ctypes.c_void_p,
+                                            ctypes.c_int, ctypes.c_int, ctypes.c_int]
 lib.w2a8_set_device.restype  = None
 lib.w2a8_set_device.argtypes = [ctypes.c_int]
 lib.w2a8_set_device(ctypes.c_int(0))
@@ -338,26 +338,39 @@ def forward_layer(h, layer, kv_cache, pos):
     q = rope(q, pos)
     k = rope(k, pos)
 
-    # Pack K → INT2, per-token per-head scale, append to cache
+    # Pack K → INT2, per-token per-head scale, write directly into pre-allocated GPU cache
     k_int2, k_sc = pack_k_int2(k)
-    kv_cache['k_int2'].append(k_int2)
-    kv_cache['k_sc'].append(k_sc)
-    kv_cache['v'].append(v)
-    seq_len = len(kv_cache['k_int2'])
+    sl = kv_cache['seq_len']
+    kv_cache['k_int2'][:, :, sl] = torch.from_numpy(np.ascontiguousarray(k_int2)).cuda()
+    kv_cache['k_sc'][:,    sl]   = torch.from_numpy(np.ascontiguousarray(k_sc)).cuda()
+    kv_cache['v'][:,       sl]   = torch.from_numpy(np.ascontiguousarray(v.astype(np.float16))).cuda()
+    kv_cache['seq_len'] += 1
+    seq_len = kv_cache['seq_len']
 
-    # Build numpy buffers — expand N_KV → N_HEADS for GQA
-    K_int2_buf   = np.stack(kv_cache['k_int2'], axis=-1).astype(np.uint8)   # [N_KV, HD//4, sl]
-    K_scales_buf = np.stack(kv_cache['k_sc'],   axis=-1).astype(np.float16)  # [N_KV, sl]
-    K_int2_exp   = np.repeat(K_int2_buf,   GQA_REPS, axis=0)  # [N_HEADS, HD//4, sl]
-    K_scales_exp = np.repeat(K_scales_buf, GQA_REPS, axis=0)  # [N_HEADS, sl]
+    # Build expanded GQA buffers from pre-allocated GPU tensors
+    K_int2_buf   = kv_cache['k_int2'][:, :, :seq_len]               # [N_KV, HD//4, sl]
+    K_scales_buf = kv_cache['k_sc'][:,    :seq_len]                  # [N_KV, sl]
+    K_int2_exp   = K_int2_buf.repeat_interleave(GQA_REPS, dim=0).cpu().numpy()   # [N_HEADS, HD//4, sl]
+    K_scales_exp = K_scales_buf.repeat_interleave(GQA_REPS, dim=0).cpu().numpy() # [N_HEADS, sl]
 
     q_fp32 = q.astype(np.float32)
+    q_int8c, q_act_scale = quant_act_int8(q_fp32.reshape(-1))
+    q_int8c = q_int8c.reshape(N_HEADS, HEAD_DIM)
 
-    # kv_int2_fused_attn is __global__ with no host wrapper — use Python impl
-    k_t = ks_t = q_t = sc_t = None   # unused, kept for compat if kernel ever gets wrapper
+    sl = K_int2_exp.shape[2]
+    k_t  = torch.from_numpy(np.ascontiguousarray(K_int2_exp)).cuda()
+    ks_t = torch.from_numpy(np.ascontiguousarray(K_scales_exp)).cuda()
+    q_t  = torch.from_numpy(np.ascontiguousarray(q_int8c)).cuda()
+    sc_t = torch.zeros(N_HEADS, sl, dtype=torch.float16, device='cuda')
 
-    # Attention scores via Python INT2 dequant (kernel has no host wrapper)
-    scores = kv_int2_attn(K_int2_exp, K_scales_exp, q_fp32) / math.sqrt(HEAD_DIM)
+    lib.launch_kv_int2_fused_attn(
+        ctypes.c_void_p(k_t.data_ptr()),
+        ctypes.c_void_p(ks_t.data_ptr()),
+        ctypes.c_void_p(q_t.data_ptr()),
+        ctypes.c_void_p(sc_t.data_ptr()),
+        ctypes.c_int(N_HEADS), ctypes.c_int(sl), ctypes.c_int(HEAD_DIM)
+    )
+    scores = sc_t.cpu().numpy().astype(np.float32) * q_act_scale / math.sqrt(HEAD_DIM)
     del k_t, ks_t, q_t, sc_t
 
     # Softmax
@@ -366,9 +379,8 @@ def forward_layer(h, layer, kv_cache, pos):
     att    /= att.sum(axis=-1, keepdims=True)   # [N_HEADS, seq_len]
 
     # V weighted sum (FP16→FP32, standard matmul, no custom kernel needed)
-    V_buf = np.stack(kv_cache['v'], axis=1)     # [N_KV, seq_len, HEAD_DIM]
-    V_exp = np.repeat(V_buf, GQA_REPS, axis=0) # [N_HEADS, seq_len, HEAD_DIM]
-    ao    = np.einsum('hs,hsd->hd', att, V_exp).reshape(-1)   # [HIDDEN]
+    V_buf = kv_cache['v'][:, :seq_len, :].repeat_interleave(GQA_REPS, dim=0).cpu().numpy().astype(np.float32)  # [N_HEADS, sl, HD]
+    ao    = np.einsum('hs,hsd->hd', att, V_buf).reshape(-1)   # [HIDDEN]
 
     h = h + w2a8_linear(ao, layer, "o_proj")
 
@@ -419,7 +431,11 @@ ppl_ids = tok(wt2_text, add_special_tokens=False)["input_ids"][:PPL_TOKENS + 1]
 n_score  = min(PPL_TOKENS, len(ppl_ids) - 1)
 print(f"  Scoring {n_score} tokens (teacher-forced, INT2 KV cache)...")
 
-ppl_kv    = [{'k_int2': [], 'k_sc': [], 'v': []} for _ in range(N_LAYERS)]
+MAX_SEQ  = 8192
+ppl_kv   = [{'k_int2': torch.zeros((N_KV, HEAD_DIM//4, MAX_SEQ), dtype=torch.uint8,   device='cuda'),
+              'k_sc':   torch.zeros((N_KV, MAX_SEQ),              dtype=torch.float16, device='cuda'),
+              'v':      torch.zeros((N_KV, MAX_SEQ, HEAD_DIM),    dtype=torch.float16, device='cuda'),
+              'seq_len': 0} for _ in range(N_LAYERS)]
 log_probs = []
 t_ppl0    = time.time()
 
@@ -449,7 +465,10 @@ hr("━"); print("  STEP 5: Generation (same kernel — 7 projections + fused KV
 
 def generate(prompt, max_new=60):
     ids      = tok(prompt, add_special_tokens=False)["input_ids"]
-    kv_cache = [{'k_int2': [], 'k_sc': [], 'v': []} for _ in range(N_LAYERS)]
+    kv_cache = [{'k_int2': torch.zeros((N_KV, HEAD_DIM//4, MAX_SEQ), dtype=torch.uint8,   device='cuda'),
+                 'k_sc':   torch.zeros((N_KV, MAX_SEQ),              dtype=torch.float16, device='cuda'),
+                 'v':      torch.zeros((N_KV, MAX_SEQ, HEAD_DIM),    dtype=torch.float16, device='cuda'),
+                 'seq_len': 0} for _ in range(N_LAYERS)]
 
     # Prefill: process all prompt tokens EXCEPT the last one.
     # The last token is processed as the first step of the generation loop.
@@ -488,9 +507,8 @@ def generate(prompt, max_new=60):
     print(f"  TTFT:       {ttft:.2f}s")
     print(f"  tokens/sec: {n_tok/max(elapsed,1e-9):.2f}")
     print(f"  note: 560 cudaDeviceSyncs/token (launcher design) — remove for prod")
-    kv_int2_bytes = sum(
-        sum(x.nbytes for x in kv_cache[li]['k_int2'])
-        for li in range(N_LAYERS))
+    sl_used = kv_cache[0]['seq_len']
+    kv_int2_bytes = N_LAYERS * N_KV * (HEAD_DIM // 4) * sl_used
     kv_fp16_equiv = kv_int2_bytes * 8
     print(f"  KV cache:   {kv_int2_bytes/1e6:.1f} MB INT2  "
           f"(vs {kv_fp16_equiv/1e6:.1f} MB FP16 — {kv_fp16_equiv/kv_int2_bytes:.1f}x)")
