@@ -405,7 +405,7 @@ except Exception as e:
         "cultural icon of France and one of the most recognisable structures. "
     )
 
-ppl_ids = tok.encode(wt2_text)[:PPL_TOKENS + 1]
+ppl_ids = tok(wt2_text, add_special_tokens=False)["input_ids"][:PPL_TOKENS + 1]
 n_score  = min(PPL_TOKENS, len(ppl_ids) - 1)
 print(f"  Scoring {n_score} tokens (teacher-forced, INT2 KV cache)...")
 
@@ -439,9 +439,10 @@ del ppl_kv; gc.collect(); torch.cuda.empty_cache()
 hr("━"); print("  STEP 5: Generation (same kernel — 7 projections + fused KV per token)"); hr("━")
 
 def generate(prompt, max_new=60):
-    ids      = tok.encode(prompt)
+    ids      = tok(prompt, add_special_tokens=False)["input_ids"]
     kv_cache = [{'k_int2': [], 'k_sc': [], 'v': []} for _ in range(N_LAYERS)]
 
+    h = embed[ids[0]].astype(np.float32)
     for pi, tid in enumerate(ids):
         h = embed[tid].astype(np.float32)
         for li in range(N_LAYERS):
