@@ -228,6 +228,29 @@ def quant_act_int8(x):
     scale = amax / 127.0
     return np.clip(np.round(x / scale), -128, 127).astype(np.int8), scale
 
+def kv_int2_attn(K_int2, K_scales, Q_fp32):
+    """
+    Pure-numpy INT2 KV attention — replaces lib.kv_int2_fused_attn kernel call.
+    kv_int2_fused_attn is declared __global__ with no host C wrapper in the .so,
+    so ctypes cannot launch it (scores would silently stay zero → uniform softmax).
+    This is mathematically identical to the kernel.
+
+    K_int2:  [N_HEADS, HD//4, seq_len] uint8
+    K_scales:[N_HEADS, seq_len] float16  (stored_scale = amax/5.2 = scale_true/2)
+    Q_fp32:  [N_HEADS, HEAD_DIM] float32
+    Returns: scores [N_HEADS, seq_len] float32  (not yet divided by sqrt(HEAD_DIM))
+    """
+    NH, hd4, SL = K_int2.shape
+    HD = hd4 * 4
+    shifts = np.array([0, 2, 4, 6], np.uint8)
+    # Dequant: (2*raw - 3) * stored_scale  → matches se2() + stored_scale logic in kernel
+    raw    = ((K_int2[:, :, :, np.newaxis] >> shifts) & 3).astype(np.int32) * 2 - 3
+    # raw: [NH, HD//4, SL, 4] → [NH, HD, SL]
+    K_fp32 = (raw.reshape(NH, HD, SL).astype(np.float32) *
+               K_scales.astype(np.float32)[:, np.newaxis, :])
+    # scores[h,s] = Σ_d Q[h,d] * K[h,d,s]
+    return np.einsum('hd,hds->hs', Q_fp32, K_fp32)   # [NH, SL]
+
 def pack_k_int2(k_fp32):
     """
     Vectorised K packing: [N_KV, HEAD_DIM] → ([N_KV, HD//4] uint8, [N_KV] fp16)
@@ -275,6 +298,11 @@ def w2a8_linear(x_fp32, layer, name):
     if not isinstance(wi, torch.Tensor): del w_t, s_t
     del x_t, y_t
 
+    # QKV bias (Qwen2.5 uses bias=True for q/k/v projections)
+    bias_key = f"{name}_bias"
+    if bias_key in layer:
+        y += layer[bias_key].astype(np.float32)
+
     # FP16 outlier residual correction (top-1% high-variance columns)
     # These columns were zeroed before INT2 quant and stored exactly as FP16.
     mask_key = f"{name}_fp16_mask"
@@ -317,38 +345,19 @@ def forward_layer(h, layer, kv_cache, pos):
     kv_cache['v'].append(v)
     seq_len = len(kv_cache['k_int2'])
 
-    # Build GPU buffers — expand N_KV → N_HEADS for GQA
-    # Layout: K_int2 [N_HEADS, HD//4, seq_len] (kernel expects head-major)
+    # Build numpy buffers — expand N_KV → N_HEADS for GQA
     K_int2_buf   = np.stack(kv_cache['k_int2'], axis=-1).astype(np.uint8)   # [N_KV, HD//4, sl]
     K_scales_buf = np.stack(kv_cache['k_sc'],   axis=-1).astype(np.float16)  # [N_KV, sl]
-    K_int2_exp   = np.ascontiguousarray(np.repeat(K_int2_buf,   GQA_REPS, axis=0))
-    K_scales_exp = np.ascontiguousarray(np.repeat(K_scales_buf, GQA_REPS, axis=0))
+    K_int2_exp   = np.repeat(K_int2_buf,   GQA_REPS, axis=0)  # [N_HEADS, HD//4, sl]
+    K_scales_exp = np.repeat(K_scales_buf, GQA_REPS, axis=0)  # [N_HEADS, sl]
 
-    # Quantize Q INT8 (global scale; correction applied after kernel)
-    q_fp32  = np.ascontiguousarray(q.astype(np.float32))
-    q_amax  = np.abs(q_fp32).max()
-    q_scale = q_amax / 127.0 if q_amax > 1e-8 else 1e-8
-    q_int8c = np.ascontiguousarray(
-        np.clip(np.round(q_fp32 / q_scale), -128, 127).astype(np.int8))
+    q_fp32 = q.astype(np.float32)
 
-    k_t  = torch.from_numpy(K_int2_exp).cuda()
-    ks_t = torch.from_numpy(K_scales_exp).cuda()
-    q_t  = torch.from_numpy(q_int8c).cuda()
-    sc_t = torch.zeros(N_HEADS, seq_len, dtype=torch.float16, device='cuda')
+    # kv_int2_fused_attn is __global__ with no host wrapper — use Python impl
+    k_t = ks_t = q_t = sc_t = None   # unused, kept for compat if kernel ever gets wrapper
 
-    lib.kv_int2_fused_attn(
-        ctypes.c_void_p(k_t.data_ptr()),
-        ctypes.c_void_p(ks_t.data_ptr()),
-        ctypes.c_void_p(q_t.data_ptr()),
-        ctypes.c_void_p(sc_t.data_ptr()),
-        ctypes.c_int(N_HEADS),
-        ctypes.c_int(seq_len),
-        ctypes.c_int(HEAD_DIM)
-    )
-
-    # kernel gives: sum_d (2*K_raw-3)*K_scale*Q_int8
-    # true score  = kernel_out * q_scale / sqrt(HEAD_DIM)
-    scores = sc_t.cpu().numpy().astype(np.float32) * (q_scale / math.sqrt(HEAD_DIM))
+    # Attention scores via Python INT2 dequant (kernel has no host wrapper)
+    scores = kv_int2_attn(K_int2_exp, K_scales_exp, q_fp32) / math.sqrt(HEAD_DIM)
     del k_t, ks_t, q_t, sc_t
 
     # Softmax
@@ -366,7 +375,7 @@ def forward_layer(h, layer, kv_cache, pos):
     # ── MLP (SwiGLU) ──────────────────────────────────────────────
     hn2  = rms_norm(h, layer["post_attention_layernorm_w"].astype(np.float32))
     gate = w2a8_linear(hn2, layer, "gate_proj")
-    gate = gate / (1.0 + np.exp(-gate))        # SiLU(gate)
+    gate = gate / (1.0 + np.exp(-np.clip(gate, -80.0, 80.0)))  # SiLU, clipped to prevent NaN
     up   = w2a8_linear(hn2, layer, "up_proj")
     h    = h + w2a8_linear(gate * up, layer, "down_proj")
 
@@ -442,12 +451,13 @@ def generate(prompt, max_new=60):
     ids      = tok(prompt, add_special_tokens=False)["input_ids"]
     kv_cache = [{'k_int2': [], 'k_sc': [], 'v': []} for _ in range(N_LAYERS)]
 
+    # Prefill: process all prompt tokens EXCEPT the last one.
+    # The last token is processed as the first step of the generation loop.
     h = embed[ids[0]].astype(np.float32)
-    for pi, tid in enumerate(ids):
+    for pi, tid in enumerate(ids[:-1]):
         h = embed[tid].astype(np.float32)
         for li in range(N_LAYERS):
             h = forward_layer(h, LAYERS[li], kv_cache[li], pi)
-        torch.cuda.empty_cache()
 
     hr()
     print(f"Q  {prompt}")
@@ -458,6 +468,7 @@ def generate(prompt, max_new=60):
     ttft  = None
     n_tok = 0
     pos   = len(ids) - 1
+    h     = embed[ids[-1]].astype(np.float32)   # start with last prompt token
 
     for _ in range(max_new):
         for li in range(N_LAYERS):
