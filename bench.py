@@ -17,7 +17,7 @@ TOKEN  = "hf_QEJiHYgZPUSiJQX" + "ahocjOFOzBXhUNjhADB"
 REPO   = "khansang/w2a8-kernel"
 GRP    = 128
 TMPDIR = tempfile.mkdtemp()
-MDIR   = os.path.join(TMPDIR, "qwen32b")   # fixed: was mistral7b
+MDIR   = os.path.join(TMPDIR, "qwen32b")   
 os.makedirs(MDIR, exist_ok=True)
 
 def ram_gb():
