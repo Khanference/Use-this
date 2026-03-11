@@ -164,7 +164,7 @@ if qt_s is not None:
 # ══════════════════════════════════════════════════════════════════
 # STEP 3 — LOAD MODEL
 # ══════════════════════════════════════════════════════════════════
-hr("━"); print("  STEP 3: Loading model (split: even layers → GPU, odd layers → CPU)"); hr("━")
+hr("━"); print("  STEP 3: Loading model into VRAM (10.3 GB → single T4)"); hr("━")
 from transformers import AutoTokenizer
 # ── FIX 2: tokenizer files are in repo root (TMPDIR), not qwen32b/ (MDIR) ──
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-32B-Instruct")
@@ -186,7 +186,7 @@ GPU_KEYS = {"_int2", "_scales"}  # only weight tensors go to GPU, norms stay cpu
 
 def _load_layer(li, d):
     out = {}
-    on_gpu = (li % 2 == 0)
+    on_gpu = True
     for k in d.files:
         arr = d[k]
         if on_gpu and any(k.endswith(s) for s in GPU_KEYS):
@@ -195,7 +195,7 @@ def _load_layer(li, d):
             out[k] = arr
     return out
 
-print(f"  Loading {N_LAYERS} layers (even→GPU, odd→CPU)...")
+print(f"  Loading {N_LAYERS} layers → VRAM...")
 LAYERS = []
 for li in range(N_LAYERS):
     d = np.load(os.path.join(MDIR, f"layer_{li:03d}.npz"))
@@ -236,7 +236,7 @@ def pack_k_int2(k_fp32):
     """
     N, HD   = k_fp32.shape
     amax    = np.abs(k_fp32).max(axis=1, keepdims=True)
-    sc      = np.where(amax > 1e-8, amax / 2.6, 1e-8).astype(np.float32)
+    sc      = np.where(amax > 1e-8, amax / 5.2, 1e-8).astype(np.float32)  # stored_scale = scale_true/2
     scales  = sc[:, 0].astype(np.float16)
     raw     = np.clip(np.round(k_fp32 / sc + 1.5), 0, 3).astype(np.uint8)
     raw4    = raw.reshape(N, HD // 4, 4)
@@ -277,10 +277,11 @@ def w2a8_linear(x_fp32, layer, name):
 
     # FP16 outlier residual correction (top-1% high-variance columns)
     # These columns were zeroed before INT2 quant and stored exactly as FP16.
-    idx_key = f"{name}_outlier_idx"
-    if idx_key in layer and layer[idx_key].size > 0:
-        idx = layer[idx_key]                   # [n_out]
-        res = layer[f"{name}_outlier_fp16"]    # [Ko, n_out] fp16
+    mask_key = f"{name}_fp16_mask"
+    res_key  = f"{name}_fp16_res"
+    if mask_key in layer and res_key in layer and layer[mask_key].any():
+        idx = np.where(layer[mask_key])[0]     # [n_fp16]
+        res = layer[res_key]                   # [Ko, n_fp16] fp16
         y[idx] = res.T.astype(np.float32) @ x_fp32[:Ko]
 
     return y   # [M_out] fp32
@@ -424,7 +425,6 @@ for t in range(n_score):
     running_ppl = math.exp(-np.mean(log_probs))
     print(f"\r  {t+1}/{n_score}  PPL {running_ppl:.2f}  RAM {ram_gb():.1f}GB",
           end="", flush=True)
-    torch.cuda.empty_cache()
 
 ppl_measured = math.exp(-np.mean(log_probs))
 ppl_time     = time.time() - t_ppl0
@@ -471,7 +471,6 @@ def generate(prompt, max_new=60):
         n_tok += 1
         pos   += 1
         h      = embed[next_id].astype(np.float32)
-        torch.cuda.empty_cache()
 
     elapsed = time.time() - t0
     print(f"\n")
