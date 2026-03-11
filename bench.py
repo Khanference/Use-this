@@ -167,7 +167,7 @@ if qt_s is not None:
 hr("━"); print("  STEP 3: Loading model (split: even layers → GPU, odd layers → CPU)"); hr("━")
 from transformers import AutoTokenizer
 # ── FIX 2: tokenizer files are in repo root (TMPDIR), not qwen32b/ (MDIR) ──
-tok = AutoTokenizer.from_pretrained(TMPDIR)
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-32B-Instruct")
 
 embed  = np.load(os.path.join(MDIR, "embed.npz"))["weight"].astype(np.float32)
 norm_w = np.load(os.path.join(MDIR, "norm.npz"))["weight"].astype(np.float32)
