@@ -164,7 +164,7 @@ if qt_s is not None:
 # ══════════════════════════════════════════════════════════════════
 # STEP 3 — LOAD MODEL
 # ══════════════════════════════════════════════════════════════════
-hr("━"); print("  STEP 3: Loading model into RAM"); hr("━")
+hr("━"); print("  STEP 3: Loading model (split: even layers → GPU, odd layers → CPU)"); hr("━")
 from transformers import AutoTokenizer
 # ── FIX 2: tokenizer files are in repo root (TMPDIR), not qwen32b/ (MDIR) ──
 tok = AutoTokenizer.from_pretrained(TMPDIR)
@@ -180,12 +180,28 @@ _ang  = np.outer(np.arange(8192, dtype=np.float32), _freq)
 RCos  = np.cos(_ang).astype(np.float32)
 RSin  = np.sin(_ang).astype(np.float32)
 
-print(f"  Loading {N_LAYERS} layers...")
+# ── Hybrid split: even layers on GPU (~6GB VRAM), odd layers on CPU (~6GB RAM)
+# Keeps KV cache headroom free on GPU, avoids Colab RAM OOM ──
+GPU_KEYS = {"_int2", "_scales"}  # only weight tensors go to GPU, norms stay cpu
+
+def _load_layer(li, d):
+    out = {}
+    on_gpu = (li % 2 == 0)
+    for k in d.files:
+        arr = d[k]
+        if on_gpu and any(k.endswith(s) for s in GPU_KEYS):
+            out[k] = torch.from_numpy(np.ascontiguousarray(arr)).cuda()
+        else:
+            out[k] = arr
+    return out
+
+print(f"  Loading {N_LAYERS} layers (even→GPU, odd→CPU)...")
 LAYERS = []
 for li in range(N_LAYERS):
     d = np.load(os.path.join(MDIR, f"layer_{li:03d}.npz"))
-    LAYERS.append({k: d[k] for k in d.files})
-    print(f"\r  {li+1}/{N_LAYERS}  RAM {ram_gb():.2f} GB", end="", flush=True)
+    LAYERS.append(_load_layer(li, d))
+    print(f"\r  {li+1}/{N_LAYERS}  RAM {ram_gb():.2f} GB  VRAM {vram_mb():.0f} MB",
+          end="", flush=True)
 print(f"\n  ✓ Model loaded  RAM {ram_gb():.2f} GB  VRAM {vram_mb():.0f} MB")
 
 # ══════════════════════════════════════════════════════════════════
@@ -241,8 +257,9 @@ def w2a8_linear(x_fp32, layer, name):
 
     x_int8, act_scale = quant_act_int8(x_fp32)
 
-    w_t = torch.from_numpy(np.ascontiguousarray(wi)).cuda()
-    s_t = torch.from_numpy(np.ascontiguousarray(sc)).cuda()
+    # weights may already be on GPU (even layers) or still numpy (odd layers)
+    w_t = wi if isinstance(wi, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(wi)).cuda()
+    s_t = sc if isinstance(sc, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(sc)).cuda()
     x_t = torch.from_numpy(np.ascontiguousarray(x_int8)).cuda()
     y_t = torch.zeros(M, dtype=torch.float16, device='cuda')
 
@@ -255,7 +272,8 @@ def w2a8_linear(x_fp32, layer, name):
     )
 
     y = y_t.cpu().numpy().astype(np.float32) * act_scale
-    del w_t, s_t, x_t, y_t
+    if not isinstance(wi, torch.Tensor): del w_t, s_t
+    del x_t, y_t
 
     # FP16 outlier residual correction (top-1% high-variance columns)
     # These columns were zeroed before INT2 quant and stored exactly as FP16.
