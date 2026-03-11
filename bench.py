@@ -254,16 +254,17 @@ def kv_int2_attn(K_int2, K_scales, Q_fp32):
 def pack_k_int2(k_fp32):
     """
     Vectorised K packing: [N_KV, HEAD_DIM] → ([N_KV, HD//4] uint8, [N_KV] fp16)
-    Midpoint lattice: i = clamp(round(v/sc + 1.5), 0, 3), sc = amax/2.6
-    Per-token per-head scale: +2.2 dB over per-head-only.
+    Levels: {-1.5,-0.5,0.5,1.5}. scale_true = amax/1.5. stored_scale = scale_true/2 = amax/3.0
+    Kernel reconstructs: (2*raw-3) * stored_scale = (raw-1.5) * scale_true ✓
     """
-    N, HD   = k_fp32.shape
-    amax    = np.abs(k_fp32).max(axis=1, keepdims=True)
-    sc      = np.where(amax > 1e-8, amax / 5.2, 1e-8).astype(np.float32)  # stored_scale = scale_true/2
-    scales  = sc[:, 0].astype(np.float16)
-    raw     = np.clip(np.round(k_fp32 / sc + 1.5), 0, 3).astype(np.uint8)
-    raw4    = raw.reshape(N, HD // 4, 4)
-    packed  = (raw4[:,:,0] | (raw4[:,:,1]<<2) | (raw4[:,:,2]<<4) | (raw4[:,:,3]<<6)).astype(np.uint8)
+    N, HD      = k_fp32.shape
+    amax       = np.abs(k_fp32).max(axis=1, keepdims=True)
+    scale_true = np.where(amax > 1e-8, amax / 1.5, 1e-8).astype(np.float32)
+    sc         = (scale_true / 2.0).astype(np.float32)   # stored_scale
+    scales     = sc[:, 0].astype(np.float16)
+    raw        = np.clip(np.round(k_fp32 / scale_true + 1.5), 0, 3).astype(np.uint8)
+    raw4       = raw.reshape(N, HD // 4, 4)
+    packed     = (raw4[:,:,0] | (raw4[:,:,1]<<2) | (raw4[:,:,2]<<4) | (raw4[:,:,3]<<6)).astype(np.uint8)
     return packed, scales
 
 def w2a8_linear(x_fp32, layer, name):
@@ -347,31 +348,26 @@ def forward_layer(h, layer, kv_cache, pos):
     kv_cache['seq_len'] += 1
     seq_len = kv_cache['seq_len']
 
-    # Build expanded GQA buffers from pre-allocated GPU tensors
-    K_int2_buf   = kv_cache['k_int2'][:, :, :seq_len]               # [N_KV, HD//4, sl]
-    K_scales_buf = kv_cache['k_sc'][:,    :seq_len]                  # [N_KV, sl]
-    K_int2_exp   = K_int2_buf.repeat_interleave(GQA_REPS, dim=0).cpu().numpy()   # [N_HEADS, HD//4, sl]
-    K_scales_exp = K_scales_buf.repeat_interleave(GQA_REPS, dim=0).cpu().numpy() # [N_HEADS, sl]
+    # GQA expansion stays on GPU — no .cpu().numpy() until scores come back
+    K_int2_exp   = kv_cache['k_int2'][:, :, :seq_len].repeat_interleave(GQA_REPS, dim=0)  # [N_HEADS, HD//4, sl] GPU
+    K_scales_exp = kv_cache['k_sc'][:,    :seq_len].repeat_interleave(GQA_REPS, dim=0)    # [N_HEADS, sl] GPU
 
     q_fp32 = q.astype(np.float32)
     q_int8c, q_act_scale = quant_act_int8(q_fp32.reshape(-1))
     q_int8c = q_int8c.reshape(N_HEADS, HEAD_DIM)
 
-    sl = K_int2_exp.shape[2]
-    k_t  = torch.from_numpy(np.ascontiguousarray(K_int2_exp)).cuda()
-    ks_t = torch.from_numpy(np.ascontiguousarray(K_scales_exp)).cuda()
     q_t  = torch.from_numpy(np.ascontiguousarray(q_int8c)).cuda()
-    sc_t = torch.zeros(N_HEADS, sl, dtype=torch.float16, device='cuda')
+    sc_t = torch.zeros(N_HEADS, seq_len, dtype=torch.float16, device='cuda')
 
     lib.launch_kv_int2_fused_attn(
-        ctypes.c_void_p(k_t.data_ptr()),
-        ctypes.c_void_p(ks_t.data_ptr()),
+        ctypes.c_void_p(K_int2_exp.data_ptr()),
+        ctypes.c_void_p(K_scales_exp.data_ptr()),
         ctypes.c_void_p(q_t.data_ptr()),
         ctypes.c_void_p(sc_t.data_ptr()),
-        ctypes.c_int(N_HEADS), ctypes.c_int(sl), ctypes.c_int(HEAD_DIM)
+        ctypes.c_int(N_HEADS), ctypes.c_int(seq_len), ctypes.c_int(HEAD_DIM)
     )
-    scores = sc_t.cpu().numpy().astype(np.float32) * q_act_scale / math.sqrt(HEAD_DIM)
-    del k_t, ks_t, q_t, sc_t
+    scores = sc_t.cpu().numpy().astype(np.float32) * (q_act_scale / math.sqrt(HEAD_DIM))
+    del q_t, sc_t, K_int2_exp, K_scales_exp
 
     # Softmax
     scores -= scores.max(axis=-1, keepdims=True)
