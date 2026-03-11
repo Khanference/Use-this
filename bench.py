@@ -108,7 +108,10 @@ for i, fname in enumerate(all_files):
           end="", flush=True)
 print()
 
-with open(os.path.join(MDIR, "config.json")) as f: cfg = json.load(f)
+# ── FIX 1: config.json is in repo root, not qwen32b/ ──
+cfg_path = hf_hub_download(repo_id=REPO, filename="config.json",
+                           local_dir=TMPDIR, token=TOKEN)
+with open(cfg_path) as f: cfg = json.load(f)
 N_LAYERS = cfg["num_hidden_layers"]
 HIDDEN   = cfg["hidden_size"]
 FFN      = cfg["intermediate_size"]
@@ -163,7 +166,8 @@ if qt_s is not None:
 # ══════════════════════════════════════════════════════════════════
 hr("━"); print("  STEP 3: Loading model into RAM"); hr("━")
 from transformers import AutoTokenizer
-tok = AutoTokenizer.from_pretrained(MDIR)
+# ── FIX 2: tokenizer files are in repo root (TMPDIR), not qwen32b/ (MDIR) ──
+tok = AutoTokenizer.from_pretrained(TMPDIR)
 
 embed  = np.load(os.path.join(MDIR, "embed.npz"))["weight"].astype(np.float32)
 norm_w = np.load(os.path.join(MDIR, "norm.npz"))["weight"].astype(np.float32)
@@ -354,10 +358,6 @@ def forward_layer(h, layer, kv_cache, pos):
 # ══════════════════════════════════════════════════════════════════
 hr("━"); print("  STEP 4: Perplexity — WikiText-2, teacher-forced"); hr("━")
 
-# Why teacher-forced: feed true tokens, score true next token.
-# Why NOT numpy dequant: a 5120×5120 numpy matmul is ~20ms vs ~0.5ms kernel.
-# 64 layers × 7 projections × 0.5ms = 224ms/token → 80 tokens ≈ 18s.
-# PPL measures model QUALITY (identical math regardless of compute path).
 PPL_TOKENS = 80
 
 try:
@@ -424,7 +424,6 @@ def generate(prompt, max_new=60):
     ids      = tok.encode(prompt)
     kv_cache = [{'k_int2': [], 'k_sc': [], 'v': []} for _ in range(N_LAYERS)]
 
-    # Prefill: build KV cache from input tokens
     for pi, tid in enumerate(ids):
         h = embed[tid].astype(np.float32)
         for li in range(N_LAYERS):
@@ -463,7 +462,7 @@ def generate(prompt, max_new=60):
     kv_int2_bytes = sum(
         sum(x.nbytes for x in kv_cache[li]['k_int2'])
         for li in range(N_LAYERS))
-    kv_fp16_equiv = kv_int2_bytes * 8   # INT2 vs FP16 ratio
+    kv_fp16_equiv = kv_int2_bytes * 8
     print(f"  KV cache:   {kv_int2_bytes/1e6:.1f} MB INT2  "
           f"(vs {kv_fp16_equiv/1e6:.1f} MB FP16 — {kv_fp16_equiv/kv_int2_bytes:.1f}x)")
 
