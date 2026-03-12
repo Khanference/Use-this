@@ -290,31 +290,23 @@ def w2a8_linear(x_fp32, layer, name):
 
     # weights may already be on GPU (even layers) or still numpy (odd layers)
     w_t = wi if isinstance(wi, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(wi)).cuda()
-
-    # FP16 OVERFLOW SHIELD: kernel output can reach ~93k which overflows FP16 max (65504).
-    # Divide scale by 128 BEFORE converting to FP16 — done in FP32 on CPU to prevent
-    # small scales (e.g. 1e-4) underflowing to zero during the division in FP16.
-    sc_np   = sc.cpu().numpy() if isinstance(sc, torch.Tensor) else sc
-    s_t_safe = torch.from_numpy(
-        (sc_np.astype(np.float32) / 128.0).astype(np.float16)
-    ).cuda()
+    s_t = sc if isinstance(sc, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(sc)).cuda()
 
     x_t = torch.from_numpy(np.ascontiguousarray(x_int8)).cuda()
     y_t = torch.zeros(M, dtype=torch.float16, device='cuda')
 
     lib.gemv_w2a8_inference(
         ctypes.c_void_p(w_t.data_ptr()),
-        ctypes.c_void_p(s_t_safe.data_ptr()),
+        ctypes.c_void_p(s_t.data_ptr()),
         ctypes.c_void_p(x_t.data_ptr()),
         ctypes.c_void_p(y_t.data_ptr()),
         ctypes.c_int(M), ctypes.c_int(K)
     )
 
-    # Reinflate by 128 alongside act_scale — single multiply, zero extra cost
-    y = y_t.cpu().numpy().astype(np.float32) * (act_scale * 128.0)
+    y = y_t.cpu().numpy().astype(np.float32) * act_scale
 
-    if not isinstance(wi, torch.Tensor): del w_t
-    del x_t, y_t, s_t_safe
+    if not isinstance(wi, torch.Tensor): del w_t, s_t
+    del x_t, y_t
 
     # 1. OUTLIERS FIRST — residual overwrites INT2 approximation for top-1% columns
     mask_key = f"{name}_fp16_mask"
@@ -368,12 +360,6 @@ def forward_layer(h, layer, kv_cache, pos):
     K_int2_exp   = kv_cache['k_int2'][:, :, :seq_len].repeat_interleave(GQA_REPS, dim=0).contiguous()
     K_scales_exp = kv_cache['k_sc'][:,    :seq_len].repeat_interleave(GQA_REPS, dim=0).contiguous()
 
-    # FP16 OVERFLOW SHIELD for KV attention scores.
-    # Division in FP32 on CPU before FP16 cast — prevents underflow of small scales.
-    K_scales_safe = torch.from_numpy(
-        (K_scales_exp.cpu().numpy().astype(np.float32) / 128.0).astype(np.float16)
-    ).cuda()
-
     # Per-head Q quantization — each head gets its own scale
     q_fp32 = q.astype(np.float32)
     q_int8c, q_act_scale = quant_q_per_head(q_fp32)   # q_act_scale: [N_HEADS, 1]
@@ -382,24 +368,21 @@ def forward_layer(h, layer, kv_cache, pos):
 
     lib.launch_kv_int2_fused_attn(
         ctypes.c_void_p(K_int2_exp.data_ptr()),
-        ctypes.c_void_p(K_scales_safe.data_ptr()),
+        ctypes.c_void_p(K_scales_exp.data_ptr()),
         ctypes.c_void_p(q_t.data_ptr()),
         ctypes.c_void_p(sc_t.data_ptr()),
         ctypes.c_int(N_HEADS), ctypes.c_int(seq_len), ctypes.c_int(HEAD_DIM)
     )
 
-    # Reinflate 128x, apply per-head Q scale, divide by sqrt(HEAD_DIM)
-    scores = sc_t.cpu().numpy().astype(np.float32) * (128.0 * q_act_scale / math.sqrt(HEAD_DIM))
-    del q_t, sc_t, K_int2_exp, K_scales_exp, K_scales_safe
-
-    # Softmax
-    scores -= scores.max(axis=-1, keepdims=True)
-    att     = np.exp(scores)
-    att    /= att.sum(axis=-1, keepdims=True)   # [N_HEADS, seq_len]
-
-    # V weighted sum (FP16→FP32, standard matmul, no custom kernel needed)
-    V_buf = kv_cache['v'][:, :seq_len, :].repeat_interleave(GQA_REPS, dim=0).cpu().numpy().astype(np.float32)  # [N_HEADS, sl, HD]
-    ao    = np.einsum('hs,hsd->hd', att, V_buf).reshape(-1)   # [HIDDEN]
+    # ── SPEED FIX: softmax + V weighted sum entirely on GPU ──
+    q_scale_t = torch.from_numpy(q_act_scale).cuda()                          # [N_HEADS, 1]
+    scores    = sc_t.to(torch.float32) * (q_scale_t / math.sqrt(HEAD_DIM))   # [N_HEADS, seq_len]
+    att       = torch.nn.functional.softmax(scores, dim=-1)                   # GPU softmax
+    V_buf     = kv_cache['v'][:, :seq_len, :].repeat_interleave(GQA_REPS, dim=0)  # [N_HEADS, sl, HD]
+    ao_t      = torch.einsum('hs,hsd->hd', att, V_buf.to(torch.float32)).reshape(-1)  # GPU matmul
+    ao        = ao_t.cpu().numpy()                                             # only 1D [HIDDEN] crosses PCIe
+    del q_t, sc_t, K_int2_exp, K_scales_exp, q_scale_t, scores, att, V_buf, ao_t
+    # ─────────────────────────────────────────────────────────────────
 
     h = h + w2a8_linear(ao, layer, "o_proj")
 
