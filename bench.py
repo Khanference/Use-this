@@ -356,32 +356,21 @@ def forward_layer(h, layer, kv_cache, pos):
     kv_cache['seq_len'] += 1
     seq_len = kv_cache['seq_len']
 
-    # GQA expansion — .contiguous() enforces dense memory layout for ctypes
-    K_int2_exp   = kv_cache['k_int2'][:, :, :seq_len].repeat_interleave(GQA_REPS, dim=0).contiguous()
-    K_scales_exp = kv_cache['k_sc'][:,    :seq_len].repeat_interleave(GQA_REPS, dim=0).contiguous()
-
-    # Per-head Q quantization — each head gets its own scale
-    q_fp32 = q.astype(np.float32)
-    q_int8c, q_act_scale = quant_q_per_head(q_fp32)   # q_act_scale: [N_HEADS, 1]
-    q_t  = torch.from_numpy(np.ascontiguousarray(q_int8c)).cuda()
-    sc_t = torch.zeros(N_HEADS, seq_len, dtype=torch.float16, device='cuda')
-
-    lib.launch_kv_int2_fused_attn(
-        ctypes.c_void_p(K_int2_exp.data_ptr()),
-        ctypes.c_void_p(K_scales_exp.data_ptr()),
-        ctypes.c_void_p(q_t.data_ptr()),
-        ctypes.c_void_p(sc_t.data_ptr()),
-        ctypes.c_int(N_HEADS), ctypes.c_int(seq_len), ctypes.c_int(HEAD_DIM)
-    )
+    # launch_kv_int2_fused_attn is __global__ with no host wrapper — ctypes writes
+    # nothing to sc_t, scores stay zero, softmax is uniform → mädchen forever.
+    # kv_int2_attn is mathematically identical and actually works.
+    q_fp32       = q.astype(np.float32)
+    K_int2_exp   = kv_cache['k_int2'][:, :, :seq_len].repeat_interleave(GQA_REPS, dim=0).cpu().numpy()
+    K_scales_exp = kv_cache['k_sc'][:,    :seq_len].repeat_interleave(GQA_REPS, dim=0).cpu().numpy()
+    scores       = kv_int2_attn(K_int2_exp, K_scales_exp, q_fp32) / math.sqrt(HEAD_DIM)
 
     # ── SPEED FIX: softmax + V weighted sum entirely on GPU ──
-    q_scale_t = torch.from_numpy(q_act_scale).cuda()                          # [N_HEADS, 1]
-    scores    = sc_t.to(torch.float32) * (q_scale_t / math.sqrt(HEAD_DIM))   # [N_HEADS, seq_len]
-    att       = torch.nn.functional.softmax(scores, dim=-1)                   # GPU softmax
-    V_buf     = kv_cache['v'][:, :seq_len, :].repeat_interleave(GQA_REPS, dim=0)  # [N_HEADS, sl, HD]
-    ao_t      = torch.einsum('hs,hsd->hd', att, V_buf.to(torch.float32)).reshape(-1)  # GPU matmul
-    ao        = ao_t.cpu().numpy()                                             # only 1D [HIDDEN] crosses PCIe
-    del q_t, sc_t, K_int2_exp, K_scales_exp, q_scale_t, scores, att, V_buf, ao_t
+    scores_t = torch.from_numpy(scores).cuda()
+    att      = torch.nn.functional.softmax(scores_t, dim=-1)
+    V_buf    = kv_cache['v'][:, :seq_len, :].repeat_interleave(GQA_REPS, dim=0)
+    ao_t     = torch.einsum('hs,hsd->hd', att, V_buf.to(torch.float32)).reshape(-1)
+    ao       = ao_t.cpu().numpy()
+    del K_int2_exp, K_scales_exp, scores_t, att, V_buf, ao_t
     # ─────────────────────────────────────────────────────────────────
 
     h = h + w2a8_linear(ao, layer, "o_proj")
