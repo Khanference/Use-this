@@ -228,6 +228,13 @@ def quant_act_int8(x):
     scale = amax / 127.0
     return np.clip(np.round(x / scale), -128, 127).astype(np.int8), scale
 
+def quant_q_per_head(q_fp32):
+    """Per-head INT8 quantization — prevents one loud head crushing the other 39."""
+    amax  = np.abs(q_fp32).max(axis=-1, keepdims=True)          # [N_HEADS, 1]
+    scale = np.where(amax > 1e-8, amax / 127.0, 1e-8).astype(np.float32)
+    q_int8 = np.clip(np.round(q_fp32 / scale), -128, 127).astype(np.int8)
+    return q_int8, scale                                         # scale: [N_HEADS, 1]
+
 def kv_int2_attn(K_int2, K_scales, Q_fp32):
     """
     Pure-numpy INT2 KV attention — replaces lib.kv_int2_fused_attn kernel call.
@@ -299,19 +306,18 @@ def w2a8_linear(x_fp32, layer, name):
     if not isinstance(wi, torch.Tensor): del w_t, s_t
     del x_t, y_t
 
-    # QKV bias (Qwen2.5 uses bias=True for q/k/v projections)
-    bias_key = f"{name}_bias"
-    if bias_key in layer:
-        y += layer[bias_key].astype(np.float32)
-
-    # FP16 outlier residual correction (top-1% high-variance columns)
-    # These columns were zeroed before INT2 quant and stored exactly as FP16.
+    # 1. OUTLIERS FIRST — residual overwrites INT2 approximation for top-1% columns
     mask_key = f"{name}_fp16_mask"
     res_key  = f"{name}_fp16_res"
     if mask_key in layer and res_key in layer and layer[mask_key].any():
         idx = np.where(layer[mask_key])[0]     # [n_fp16]
         res = layer[res_key]                   # [Ko, n_fp16] fp16
         y[idx] = res.T.astype(np.float32) @ x_fp32[:Ko]
+
+    # 2. BIAS SECOND — added on top of already-corrected output
+    bias_key = f"{name}_bias"
+    if bias_key in layer:
+        y += layer[bias_key].astype(np.float32)
 
     return y   # [M_out] fp32
 
@@ -348,14 +354,13 @@ def forward_layer(h, layer, kv_cache, pos):
     kv_cache['seq_len'] += 1
     seq_len = kv_cache['seq_len']
 
-    # GQA expansion stays on GPU — no .cpu().numpy() until scores come back
-    K_int2_exp   = kv_cache['k_int2'][:, :, :seq_len].repeat_interleave(GQA_REPS, dim=0)  # [N_HEADS, HD//4, sl] GPU
-    K_scales_exp = kv_cache['k_sc'][:,    :seq_len].repeat_interleave(GQA_REPS, dim=0)    # [N_HEADS, sl] GPU
+    # GQA expansion — .contiguous() enforces dense memory layout for ctypes
+    K_int2_exp   = kv_cache['k_int2'][:, :, :seq_len].repeat_interleave(GQA_REPS, dim=0).contiguous()
+    K_scales_exp = kv_cache['k_sc'][:,    :seq_len].repeat_interleave(GQA_REPS, dim=0).contiguous()
 
+    # Per-head Q quantization — each head gets its own scale
     q_fp32 = q.astype(np.float32)
-    q_int8c, q_act_scale = quant_act_int8(q_fp32.reshape(-1))
-    q_int8c = q_int8c.reshape(N_HEADS, HEAD_DIM)
-
+    q_int8c, q_act_scale = quant_q_per_head(q_fp32)   # q_act_scale: [N_HEADS, 1]
     q_t  = torch.from_numpy(np.ascontiguousarray(q_int8c)).cuda()
     sc_t = torch.zeros(N_HEADS, seq_len, dtype=torch.float16, device='cuda')
 
@@ -366,6 +371,8 @@ def forward_layer(h, layer, kv_cache, pos):
         ctypes.c_void_p(sc_t.data_ptr()),
         ctypes.c_int(N_HEADS), ctypes.c_int(seq_len), ctypes.c_int(HEAD_DIM)
     )
+
+    # Per-head scale broadcast: scores[h, s] *= q_act_scale[h] / sqrt(HEAD_DIM)
     scores = sc_t.cpu().numpy().astype(np.float32) * (q_act_scale / math.sqrt(HEAD_DIM))
     del q_t, sc_t, K_int2_exp, K_scales_exp
 
